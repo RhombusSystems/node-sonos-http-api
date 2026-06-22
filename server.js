@@ -3,6 +3,27 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const auth = require('basic-auth');
+
+// VLAN deployment: Sonos cannot push UPnP events back to this host, so every real
+// event Subscriber is useless here AND a time-bomb — its renewal eventually fails,
+// emits 'dead', and triggers SonosSystem.restart(), which orphans the port-3500
+// NotificationListener (no dispose) and permanently crashes topologyChange with
+// "undefined ... endpoint" at Player.js:211. Topology is fed by the SOAP NOTIFY
+// injection below; per-zone state by refresh-state-via-soap.js. So stub Subscriber
+// to a no-op before sonos-discovery captures the reference.
+(function neutralizeUpnpSubscriber() {
+  const util = require('util');
+  const EventEmitter = require('events').EventEmitter;
+  function NoopSubscriber(/* subscribeUrl, notificationUrl */) {
+    EventEmitter.call(this);
+    this.dispose = function dispose() {};
+  }
+  util.inherits(NoopSubscriber, EventEmitter);
+  const subPath = require.resolve('sonos-discovery/lib/Subscriber');
+  require(subPath);                            // ensure module is cached
+  require.cache[subPath].exports = NoopSubscriber;
+})();
+
 const SonosSystem = require('sonos-discovery');
 const logger = require('sonos-discovery/lib/helpers/logger');
 const SonosHttpAPI = require('./lib/sonos-http-api.js');
@@ -12,6 +33,76 @@ const settings = require('./settings');
 const serve = new serveStatic(settings.webroot);
 const discovery = new SonosSystem(settings);
 const api = new SonosHttpAPI(discovery, settings);
+
+// Sonos speakers are on separate VLANs (10.1.4.x, 10.1.11.x) so SSDP multicast
+// and UPnP event subscriptions both fail — Pi can reach Sonos but Sonos cannot
+// push events back. Fix: seed init via ssdp.emit, then poll topology via SOAP and
+// inject a synthetic NOTIFY to the local NotificationListener (127.0.0.1:3500).
+if (settings.devices && settings.devices.length > 0) {
+  const ssdp = require('sonos-discovery/lib/sonos-ssdp');
+  const origStart = ssdp.start.bind(ssdp);
+  const SEED_IP = settings.devices[0];
+  const NOTIFICATION_PORT = 3500;
+  const SEED_UUID = 'RINCON_B8E9373F016001400'; // BDRs — coordinator used to bootstrap
+
+  const SOAP_BODY = '<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:GetZoneGroupState xmlns:u="urn:schemas-upnp-org:service:ZoneGroupTopology:1"></u:GetZoneGroupState></s:Body></s:Envelope>';
+
+  function injectTopology() {
+    const req = http.request({
+      hostname: SEED_IP, port: 1400, path: '/ZoneGroupTopology/Control',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/xml; charset="utf-8"',
+        'SOAPAction': '"urn:schemas-upnp-org:service:ZoneGroupTopology:1#GetZoneGroupState"',
+        'Content-Length': Buffer.byteLength(SOAP_BODY)
+      }
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        const match = data.match(/<ZoneGroupState>([\s\S]*?)<\/ZoneGroupState>/);
+        if (!match) return logger.warn('SOAP topology response missing ZoneGroupState');
+        const topologyXml = match[1];
+        const notifyBody = `<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0"><e:property><ZoneGroupState>${topologyXml}</ZoneGroupState></e:property></e:propertyset>`;
+        http.request({
+          hostname: '127.0.0.1', port: NOTIFICATION_PORT, method: 'NOTIFY',
+          headers: {
+            'SID': `uuid:${SEED_UUID}_sub0000000001`,
+            'Content-Type': 'text/xml',
+            'Content-Length': Buffer.byteLength(notifyBody)
+          }
+        }, () => logger.info('Injected Sonos topology via SOAP poll'))
+          .on('error', () => {})
+          .end(notifyBody);
+      });
+    });
+    req.on('error', e => logger.error(`SOAP topology fetch failed: ${e.message}`));
+    req.end(SOAP_BODY);
+  }
+
+  function seedDiscovery() {
+    logger.info(`Seeding Sonos discovery from static device ${SEED_IP}`);
+    ssdp.emit('found', {
+      household: 'static',
+      location: `http://${SEED_IP}:1400/xml/device_description.xml`,
+      ip: SEED_IP
+    });
+  }
+
+  // Patch start so future restarts (subscriber death → restart()) also re-seed
+  ssdp.start = function () {
+    origStart();
+    setTimeout(seedDiscovery, 200);
+    setTimeout(injectTopology, 2000);
+  };
+
+  // Initial bootstrap — SonosSystem already called origStart and registered once('found')
+  setTimeout(seedDiscovery, 200);
+  setTimeout(injectTopology, 2000);
+
+  // Poll topology every 30s to keep zone/player state fresh
+  setInterval(injectTopology, 30000);
+}
 
 var requestHandler = function (req, res) {
   req.addListener('end', function () {
