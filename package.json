@@ -27,7 +27,7 @@
     "elevenlabs-node": "2.0.1"
   },
   "engines": {
-    "node": ">=4 <23"
+    "node": ">=18"
   },
   "main": "lib/sonos-http-api.js",
   "license": "MIT",
