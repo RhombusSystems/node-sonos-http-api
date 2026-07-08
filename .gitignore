@@ -1,5 +1,6 @@
 node_modules
 presets.json
+static/clips/closed-won-batch-*.mp3
 presets/
 cache
 settings.json
